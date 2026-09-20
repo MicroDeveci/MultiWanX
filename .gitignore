@@ -1,0 +1,7 @@
+# 构建产物
+*.apk
+*.ipk
+
+# 编辑器 / 系统杂项
+.DS_Store
+Thumbs.db
