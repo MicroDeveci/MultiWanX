@@ -1,0 +1,56 @@
+{
+	"admin/services/mwanx": {
+		"title": "MultiWanx",
+		"order": 30,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-mwanx" ]
+		}
+	},
+	"admin/services/mwanx/overview": {
+		"title": "出口管理",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "mwanx/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-mwanx" ]
+		}
+	},
+	"admin/services/mwanx/settings": {
+		"title": "设置",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "mwanx/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-mwanx" ]
+		}
+	},
+	"admin/services/mwanx/log": {
+		"title": "运行日志",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "mwanx/log"
+		},
+		"depends": {
+			"acl": [ "luci-app-mwanx" ]
+		}
+	},
+	"admin/services/mwanx/about": {
+		"title": "关于",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "mwanx/about"
+		},
+		"depends": {
+			"acl": [ "luci-app-mwanx" ]
+		}
+	}
+}

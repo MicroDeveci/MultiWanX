@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# /etc/hotplug.d/iface/99-mwanx
+#
+# netifd 在接口 up/down 时发事件。链路一掉就立刻重选，不必等 mwanx 自己的
+# 轮询周期 —— 这是把"载波丢失"这类确定性故障从秒级压到毫秒级的关键。
+#
+# 注意：只有链路事件才有用。链路还在、仅仅外网不通不会产生任何事件，
+# 那种情况只能靠 mwanx 的轮询兜底。
+#
+# 出口列表不写死，直接读 uci，免得和配置脱节。
+
+case "$ACTION" in
+	ifdown|disconnected|ifup|connected) ;;
+	*) exit 0 ;;
+esac
+
+for s in $(uci -q show mwanx 2>/dev/null | sed -n 's/^mwanx\.\([^.=]*\)=uplink$/\1/p'); do
+	[ "$(uci -q get "mwanx.$s.iface")" = "$INTERFACE" ] || continue
+
+	case "$ACTION" in
+		# down 事件是确定的，直接顶到阈值立刻切，不等防抖
+		ifdown|disconnected) exec /usr/bin/mwanx fail "$INTERFACE" ;;
+		# up 事件正常探测即可，通了会自动回切
+		ifup|connected)      exec /usr/bin/mwanx check ;;
+	esac
+done
+
+exit 0

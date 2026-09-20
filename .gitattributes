@@ -1,0 +1,4 @@
+# 这些文件最终都要跑到 Linux 路由器上。必须强制 LF —— 否则在 Windows 上
+# clone 出来是 CRLF，shell 脚本的 shebang 变成 "#!/bin/sh\r"，执行时报
+# bad interpreter。
+* text=auto eol=lf

@@ -1,0 +1,52 @@
+# /etc/config/mwanx
+#
+# 多出口优先级管理。数字越小的 order 越优先。
+#
+# 命令行查看帮助：  mwanx help
+# 查某个命令：      mwanx help add
+# 新增出口：        mwanx add <名字> --device <设备> --iface <network接口> --order <n>
+#
+# 这个文件随 mwanx 包以 conffile 方式安装：升级/重装时 apk 保留你改过的这份，
+# 不会被包里的默认值覆盖。所以这里只放通用默认值 ——
+# 出口（uplink 段）是每台机器自己的数据，不随包分发，用 mwanx add 或界面加。
+#
+# 新机器部署顺序：装完文件后必须先 mwanx sync-metrics && /etc/init.d/network reload，
+#                 否则 netifd 以 metric 0 装的默认路由会压过覆盖路由，切换静默失效。
+
+config globals 'globals'
+	# 总开关
+	option enabled '1'
+	# 健康检查间隔（秒）—— 最快挡位
+	option interval '2'
+	# 连续失败几次才判定该出口不可用，防抖 —— 最快挡位
+	# 注意：阈值越低越容易被单次丢包骗到，来回切；每次切换都会断一次连接
+	option fail_threshold '2'
+	# 每次探测发几个包、单包超时几秒 —— 最快挡位
+	# 最坏一轮耗时 = probe_count * probe_timeout + interval
+	option probe_count '1'
+	option probe_timeout '1'
+	# 默认探测目标，单个出口可用 test_ip / test_ip6 覆盖。
+	# test_ip6 只在出口是 IPv6 单栈（或想单独指定）时才用得上。
+	# 2400:3200::1 是阿里公共 DNS 的 v6 地址。
+	option test_ip '223.5.5.5'
+	option test_ip6 '2400:3200::1'
+	# 切换时插入的覆盖路由的 metric，必须严格小于所有 order。
+	# v4 和 v6 各自一张路由表，共用这一个值不会互相干扰。
+	option override_metric '1'
+
+	# ---- 自动纳管 ----
+	# 把防火墙 wan 区里新出现的接口自动加成出口，排到优先级最后
+	option auto_add '1'
+	# 扫描间隔（秒）。新接口晚十几秒纳管无所谓，不必每轮都扫
+	option autoadd_interval '15'
+	# 纳管后如何让 network.<iface>.metric 生效：
+	#   none   只写配置，界面提示你手动应用
+	#   ifup   只 ifup 新增的那条接口（默认，比整体重载轻）
+	#   reload 完整重载 network（真正即插即用，但所有出口会抖一下）
+	option metric_apply 'ifup'
+
+	# ---- 日志持久化 ----
+	# /var 是指向 /tmp 的软链，重启就没了，所以想留痕必须单独写文件
+	option log_persist '0'
+	option log_days '60'
+	option log_file '/srv/mwanx/mwanx.log'

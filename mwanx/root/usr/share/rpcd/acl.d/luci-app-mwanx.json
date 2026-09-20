@@ -1,0 +1,18 @@
+{
+	"luci-app-mwanx": {
+		"description": "Grant access to the mwanx multi-uplink failover controls",
+		"read": {
+			"ubus": {
+				"luci.mwanx": [ "status", "logs", "scan", "backup" ]
+			},
+			"uci": [ "mwanx" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.mwanx": [ "check", "sync_metrics", "reload_network", "clear", "add_uplink", "autoadd", "restore_defaults" ],
+				"uci": [ "add", "set", "delete", "order", "commit", "apply" ]
+			},
+			"uci": [ "mwanx" ]
+		}
+	}
+}

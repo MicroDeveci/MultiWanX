@@ -1,0 +1,1013 @@
+#!/bin/sh
+#
+# mwanx - 多出口优先级管理与故障切换
+#
+# 设计目标：按 order 从小到大选第一个"可用"的出口，插一条低 metric 的覆盖路由指向它。
+#          不用 fwmark、不碰 nft、不清 conntrack，避免和 fwmark 类插件抢标记。
+#
+# 用法见 mwanx help
+
+. /lib/functions.sh
+
+STATE_DIR=/tmp/mwanx
+LOG_TAG=mwanx
+# 同一条出口两次 ifup 之间的最小间隔（秒）
+BRINGUP_COOLDOWN=60
+# 自动纳管的扫描间隔（秒）。循环每轮都扫太浪费，新接口晚十几秒纳管无所谓。
+AUTOADD_INTERVAL=15
+# 并发锁。do_check / cmd_fail（hotplug 调）/ cmd_auto 会并发读写
+# /tmp/mwanx/active 和路由表；自动纳管还会写 UCI，和前端保存互相覆盖。
+LOCK_DIR="$STATE_DIR/lock"
+
+mkdir -p "$STATE_DIR"
+
+# ---------- 日志 ----------
+#
+# 默认只进 syslog 环形缓冲 —— 而 /var 是指向 /tmp 的软链，tmpfs，重启就没。
+# 打开 log_persist 后额外追加一份到文件。行首是 YYYY-MM-DD HH:MM:SS，
+# 按天清理时做字典序比较即可，不用碰 epoch 换算。
+# 用 >> 追加是因为 O_APPEND 对短行是原子的，能和 hotplug 那条路径并发写。
+log_file() { p=$(conf log_file); echo "${p:-/srv/mwanx/mwanx.log}"; }
+
+log() {
+	logger -t "$LOG_TAG" "$*"
+	[ "$(conf log_persist)" = "1" ] || return 0
+	f=$(log_file)
+	mkdir -p "$(dirname "$f")" 2>/dev/null
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$f" 2>/dev/null
+	return 0
+}
+
+# ---------- 并发锁 ----------
+# mkdir 做锁：可移植，不依赖 busybox 是否带 flock。
+#
+# LOCK_TRIES 控制最多等几秒。默认可等较久，但 hotplug 那条路径必须设成很小的值 ——
+# 它跑在 netifd 的事件处理上下文里，等锁等于把 netifd 卡住。
+#
+# 带僵死接管：万一持锁进程被杀导致锁目录残留，不接管的话故障切换会永久瘫痪。
+with_lock() {
+	max=${LOCK_TRIES:-8}
+	n=0
+	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+		n=$((n + 1))
+		if [ $n -gt "$max" ]; then
+			old=$(cat "$LOCK_DIR/ts" 2>/dev/null || echo 0)
+			now=$(cut -d. -f1 /proc/uptime)
+			if [ $((now - old)) -gt 60 ]; then
+				log "lock held for $((now - old))s, taking over as stale"
+				rm -rf "$LOCK_DIR"
+				continue
+			fi
+			return 1
+		fi
+		sleep 1
+	done
+	cut -d. -f1 /proc/uptime > "$LOCK_DIR/ts"
+
+	"$@"
+	rc=$?
+	# 必须 rm -rf：锁目录里有 ts 文件，rmdir 在非空目录上必然失败，
+	# 会导致锁第一次用完就永久泄漏，之后谁都抢不到。
+	rm -rf "$LOCK_DIR"
+	return $rc
+}
+
+# ---------- 配置读取 ----------
+conf()      { uci -q get "mwanx.globals.$1"; }
+dev_of()    { uci -q get "mwanx.$1.device"; }
+iface_of()  { uci -q get "mwanx.$1.iface"; }
+order_of()  { uci -q get "mwanx.$1.order"; }
+testip_of() { uci -q get "mwanx.$1.test_ip"; }
+
+ovr_metric()  { m=$(conf override_metric); [ -n "$m" ] || m=1; echo "$m"; }
+threshold()   { t=$(conf fail_threshold);  [ -n "$t" ] || t=3; echo "$t"; }
+interval()    { i=$(conf interval);        [ -n "$i" ] || i=5; echo "$i"; }
+probe_count()   { c=$(conf probe_count);   [ -n "$c" ] || c=2; echo "$c"; }
+probe_timeout() { w=$(conf probe_timeout); [ -n "$w" ] || w=1; echo "$w"; }
+# 自动纳管缺省为开（配置里没这一项时也算开）
+auto_add_on()  { [ "$(conf auto_add)" != "0" ]; }
+metric_apply() { m=$(conf metric_apply); echo "${m:-ifup}"; }
+log_days()     { d=$(conf log_days); echo "${d:-60}"; }
+
+uplink_names() {
+	uci -q show mwanx 2>/dev/null | sed -n 's/^mwanx\.\([^.=]*\)=uplink$/\1/p'
+}
+
+# 所有出口按 order 排序（含 disabled，list 用）
+all_sorted() {
+	for u in $(uplink_names); do
+		o=$(order_of "$u"); [ -n "$o" ] || o=99
+		echo "$o $u"
+	done | sort -n | cut -d' ' -f2
+}
+
+# 仅 enabled 的，按 order 排序（选路用）
+enabled_sorted() {
+	for u in $(uplink_names); do
+		[ "$(uci -q get "mwanx.$u.enabled")" = "1" ] || continue
+		o=$(order_of "$u"); [ -n "$o" ] || o=99
+		echo "$o $u"
+	done | sort -n | cut -d' ' -f2
+}
+
+# ---------- 状态 ----------
+# 支持双栈之后，v4 和 v6 可能选中不同出口，所以生效状态分家族记。
+active4()     { cat "$STATE_DIR/active4" 2>/dev/null; }
+active6()     { cat "$STATE_DIR/active6" 2>/dev/null; }
+set_active4() { echo "$1" > "$STATE_DIR/active4"; }
+set_active6() { echo "$1" > "$STATE_DIR/active6"; }
+clear_active4() { rm -f "$STATE_DIR/active4"; }
+clear_active6() { rm -f "$STATE_DIR/active6"; }
+is_active_any() { [ "$1" = "$(active4)" ] || [ "$1" = "$(active6)" ]; }
+
+fails()      { cat "$STATE_DIR/fail.$1" 2>/dev/null || echo 0; }
+bump_fail()  { echo $(( $(fails "$1") + 1 )) > "$STATE_DIR/fail.$1"; }
+reset_fail() { echo 0 > "$STATE_DIR/fail.$1"; }
+
+# ---------- 地址族 ----------
+# v6 必须限定 scope global。任何 up 的接口都挂着 fe80:: 链路本地地址，
+# 不排除的话纯 v4 的接口会被误判成双栈，然后去装一条永远选不上的 v6 路由。
+has_ip4() { ip -4 addr show "$1" 2>/dev/null | grep -q "inet "; }
+has_ip6() { ip -6 addr show "$1" scope global 2>/dev/null | grep -q "inet6 "; }
+
+# 设备上有没有任一族的地址（用来判断"接口是不是压根没起来"）
+has_addr() { has_ip4 "$1" || has_ip6 "$1"; }
+
+# 出口带哪几族，形如 "4" / "6" / "46"。都没地址就返回空。
+family_of() {
+	d=$(dev_of "$1")
+	[ -n "$d" ] || return 0
+	f=""
+	has_ip4 "$d" && f="4"
+	has_ip6 "$d" && f="${f:+$f}6"
+	echo "$f"
+}
+
+# 出口是否具备某一族（$1=族 4|6，$2=出口名）
+has_family() {
+	case "$(family_of "$2")" in
+		*"$1"*) return 0 ;;
+		*)      return 1 ;;
+	esac
+}
+
+# 出口能否真的为某一族提供默认路由 —— 有该族网关，或者是点对点链路。
+#
+# 光有地址不够：一个双栈出口可能只有 v4 网关（比如 LAN 口的 ULA 地址），
+# 让它占着 v6 的候选位置，装路由必然失败、然后退避，真正能用的 v6 出口
+# 就永远轮不上。所以候选资格必须看"能不能装路由"，不是"有没有地址"。
+can_route() {
+	case "$1" in
+		6) [ -n "$(gw6_of "$2")" ] || is_p2p "$(dev_of "$2")" ;;
+		*) [ -n "$(gw4_of "$2")" ] || is_p2p "$(dev_of "$2")" ;;
+	esac
+}
+
+# 取出口的默认网关。
+# 先看主表默认路由里 "via" 后面那一项；取不到就回退问 netifd —— 有些接口
+# netifd 知道 nexthop 却没把默认路由装进主表。
+# 两条路都拿不到才返回空，由 apply_route 决定是否拒绝。
+gw4_of() {
+	d=$(dev_of "$1")
+	g=$(ip -4 route show default dev "$d" 2>/dev/null | awk '
+		{ for (i = 1; i < NF; i++) if ($i == "via") { print $(i+1); exit } }
+	')
+	[ -n "$g" ] && { echo "$g"; return; }
+
+	i=$(iface_of "$1")
+	[ -n "$i" ] || return 0
+	g=$(ubus call "network.interface.$i" status 2>/dev/null \
+		| sed -n 's/.*"nexthop": *"\([0-9][0-9.]*\)".*/\1/p' | head -1)
+	[ -n "$g" ] && [ "$g" != "0.0.0.0" ] && echo "$g"
+	return 0
+}
+
+# v6 网关。同理，只是换一张表和另一种地址形状。
+gw6_of() {
+	d=$(dev_of "$1")
+	g=$(ip -6 route show default dev "$d" 2>/dev/null | awk '
+		{ for (i = 1; i < NF; i++) if ($i == "via") { print $(i+1); exit } }
+	')
+	[ -n "$g" ] && { echo "$g"; return; }
+
+	i=$(iface_of "$1")
+	[ -n "$i" ] || return 0
+	g=$(ubus call "network.interface.$i" status 2>/dev/null \
+		| sed -n 's/.*"nexthop": *"\([0-9a-fA-F][0-9a-fA-F:]*\)".*/\1/p' | head -1)
+	[ -n "$g" ] && [ "$g" != "::" ] && echo "$g"
+	return 0
+}
+
+# 出口的 v6 测活目标，没单独指定就用全局默认
+testip6_of() {
+	t=$(uci -q get "mwanx.$1.test_ip6")
+	[ -n "$t" ] || t=$(conf test_ip6)
+	[ -n "$t" ] || t=2400:3200::1
+	echo "$t"
+}
+
+probe() {
+	# $1=uplink  $2=包数(可选)  $3=超时秒(可选)
+	# 双栈出口只探 v4 —— v4 是主，同一条链路上 v4 断了 v6 基本也断；
+	# 两族都探会让失败计数双倍累加，fail_threshold 的语义就乱了。
+	d=$(dev_of "$1")
+	[ -n "$d" ] || return 1
+	c=${2:-$(probe_count)}
+	w=${3:-$(probe_timeout)}
+
+	if has_ip4 "$d"; then
+		t=$(testip_of "$1")
+		[ -n "$t" ] || t=$(conf test_ip)
+		[ -n "$t" ] || return 1
+		ping -I "$d" -c "$c" -W "$w" "$t" >/dev/null 2>&1
+	elif has_ip6 "$d"; then
+		ping6 -I "$d" -c "$c" -W "$w" "$(testip6_of "$1")" >/dev/null 2>&1
+	else
+		return 1
+	fi
+}
+
+# 带防抖的可用性判断
+usable() {
+	u=$1
+	if probe "$u"; then
+		reset_fail "$u"
+		return 0
+	fi
+	bump_fail "$u"
+	# 还没到阈值，且它本来就是当前出口 —— 继续用，避免抖动。
+	# 双栈下两个族可能各自生效，所以只要它在任一族里生效就算"在用"。
+	if [ "$(fails "$u")" -lt "$(threshold)" ] && is_active_any "$u"; then
+		return 0
+	fi
+	return 1
+}
+
+# 判断是不是点对点链路（PPP / LTE 裸 IP / tun）。
+# 只有这类接口的默认路由才可以不带网关。广播型介质（以太网、WiFi）
+# 如果装成 `default dev eth0`，内核会对每个目的地址直接发 ARP，路由就废了。
+is_p2p() {
+	t=$(cat "/sys/class/net/$1/type" 2>/dev/null)
+	case "$t" in
+		512|768|65534) return 0 ;;   # ARPHRD_PPP / TUNNEL / NONE(裸IP)
+		*) return 1 ;;
+	esac
+}
+
+# ---------- 覆盖路由 ----------
+# 分家族各装各的：v4 进 ip route，v6 进 ip -6 route，两张表互不干扰。
+apply_route4() {
+	d=$(dev_of "$1"); g=$(gw4_of "$1")
+	if [ -n "$g" ]; then
+		ip route replace default via "$g" dev "$d" metric "$(ovr_metric)" || return 1
+	elif is_p2p "$d"; then
+		ip route replace default dev "$d" metric "$(ovr_metric)" || return 1
+	else
+		log "uplink $1: $d has no IPv4 gateway and is not point-to-point, refusing default route"
+		return 1
+	fi
+	return 0
+}
+
+apply_route6() {
+	d=$(dev_of "$1"); g=$(gw6_of "$1")
+	if [ -n "$g" ]; then
+		ip -6 route replace default via "$g" dev "$d" metric "$(ovr_metric)" || return 1
+	elif is_p2p "$d"; then
+		ip -6 route replace default dev "$d" metric "$(ovr_metric)" || return 1
+	else
+		log "uplink $1: $d has no IPv6 gateway and is not point-to-point, refusing default route"
+		return 1
+	fi
+	return 0
+}
+
+clear_route4() {
+	n=0
+	while [ $n -lt 8 ]; do
+		ip route del default metric "$(ovr_metric)" 2>/dev/null || break
+		n=$((n + 1))
+	done
+}
+
+clear_route6() {
+	n=0
+	while [ $n -lt 8 ]; do
+		ip -6 route del default metric "$(ovr_metric)" 2>/dev/null || break
+		n=$((n + 1))
+	done
+}
+
+# 拉起底层接口（无线 STA 掉线时需要），只在设备连 IP 都没有时才动手。
+# 已有 IP 说明接口是好的，此时 ifup 只会造成无谓重连。
+#
+# 两点讲究：
+#  1. 不阻塞。只发出 ifup 就返回失败，下一轮再探测 —— 否则一次等待 30 秒，
+#     把 interval 拖长一个数量级，真正的故障切换也跟着变慢。
+#  2. 冷却。同一条出口在 cooldown 内不重复 ifup，免得对着一根没插网线的口
+#     每 5 秒 ifup 一次。
+bring_up() {
+	# hotplug 路径必须关掉它。cmd_fail 跑在 netifd 的事件处理上下文里，
+	# 在那里 ifup 会产生新的 hotplug 事件、再回调回 mwanx，形成重入。
+	[ "$NO_BRINGUP" = "1" ] && return 1
+
+	d=$(dev_of "$1")
+	has_addr "$d" && return 0
+
+	i=$(iface_of "$1")
+	[ -n "$i" ] || return 1
+
+	f="$STATE_DIR/bringup.$1"
+	now=$(cut -d. -f1 /proc/uptime)
+	last=$(cat "$f" 2>/dev/null || echo 0)
+	[ $((now - last)) -lt "$BRINGUP_COOLDOWN" ] && return 1
+	echo "$now" > "$f"
+
+	log "uplink $1: $d has no IP, ifup $i"
+	ifup "$i" 2>/dev/null
+	return 1
+}
+
+# 配置自检。三条都可能让切换静默失效，所以直接拒绝启动：
+#  1. order 与 override_metric 相同 —— clear_route 会误删该出口的真实默认路由
+#  2. network.<iface> 没设 metric —— netifd 会以 metric 0 装默认路由，压过覆盖路由
+#  3. network.<iface>.metric <= override_metric —— 同理，覆盖路由永远选不上
+validate_config() {
+	m=$(ovr_metric); bad=0
+	for u in $(enabled_sorted); do
+		o=$(order_of "$u")
+		if [ "$o" = "$m" ]; then
+			log "config error: uplink $u order $o equals override_metric $m, failover would delete its real default route"
+			bad=1
+		fi
+
+		i=$(iface_of "$u")
+		[ -n "$i" ] || continue
+		nm=$(uci -q get "network.$i.metric")
+		if [ -z "$nm" ]; then
+			log "config error: network.$i has no metric, netifd would install a metric 0 default route ahead of the override route ($m). Run: mwanx sync-metrics"
+			bad=1
+		elif [ "$nm" -le "$m" ] 2>/dev/null; then
+			log "config error: network.$i.metric $nm <= override_metric $m, override route would never be selected"
+			bad=1
+		fi
+	done
+	return $bad
+}
+
+# ---------- 核心：选路 ----------
+# 切换后实际查一次路由，确认包真的会走期望的设备。
+# apply_route 成功只代表"命令没报错"，不代表覆盖路由赢了 —— 如果还有一条
+# metric 更小的默认路由（比如 netifd 没配 metric 时装的 metric 0），内核会选那条，
+# 于是切换静默失效。
+verify_route() {
+	# $1=族 4|6  $2=出口名
+	fam=$1; u=$2
+	want=$(dev_of "$u")
+	if [ "$fam" = "6" ]; then
+		t=$(testip6_of "$u")
+		got=$(ip -6 route get "$t" 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
+	else
+		t=$(testip_of "$u"); [ -n "$t" ] || t=$(conf test_ip)
+		got=$(ip route get "$t" 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
+	fi
+	if [ "$got" != "$want" ]; then
+		log "warning: v$fam switched to $u but traffic to $t goes via $got, override route not effective (check network.*.metric)"
+	fi
+	return 0
+}
+
+# 装路由失败了就别每轮重试 —— 每 2 秒刷一条日志会把环形缓冲冲掉，
+# 开了 log_persist 还会持续写 flash。$1=族。
+route_backoff() {
+	f="$STATE_DIR/backoff.$1"
+	last=$(cat "$f" 2>/dev/null || echo 0)
+	[ $(( $(cut -d. -f1 /proc/uptime) - last )) -lt 30 ]
+}
+route_failed() { cut -d. -f1 /proc/uptime > "$STATE_DIR/backoff.$1"; }
+route_ok()     { rm -f "$STATE_DIR/backoff.$1"; }
+
+# 让某一族的落点跟上下一次选择。$1=族  $2=选中的出口（空串表示该族没有可用出口）
+apply_family() {
+	fam=$1; best=$2
+	if [ "$fam" = "6" ]; then cur=$(active6); else cur=$(active4); fi
+	[ "$best" = "$cur" ] && return 0
+
+	if [ -z "$best" ]; then
+		if [ -n "$cur" ]; then
+			log "v$fam: no usable uplink, removing override route"
+			if [ "$fam" = "6" ]; then clear_route6; clear_active6; else clear_route4; clear_active4; fi
+		fi
+		return 1
+	fi
+
+	# 上一轮装路由失败，退避期内不再重试（也不刷日志）
+	route_backoff "$fam" && return 1
+
+	if [ "$fam" = "6" ]; then
+		apply_route6 "$best" || { route_failed 6; log "v6 switch to $best failed (no retry for 30s)"; return 1; }
+		set_active6 "$best"; route_ok 6
+	else
+		apply_route4 "$best" || { route_failed 4; log "v4 switch to $best failed (no retry for 30s)"; return 1; }
+		set_active4 "$best"; route_ok 4
+	fi
+
+	log "v$fam switched $cur -> $best (dev $(dev_of "$best"), metric $(ovr_metric))"
+	verify_route "$fam" "$best"
+	return 0
+}
+
+# 按 order 从小到大，为 v4 和 v6 **各选一个**可用出口。
+# 单栈出口只填自己那一族；双栈出口两族都填，可能同时占住两个位置。
+# 纯 v4 环境下 best6 永远为空，v6 那条路是 no-op。
+do_check() {
+	e=$(conf enabled); [ -n "$e" ] || e=1
+	[ "$e" = "1" ] || return 0
+
+	best4=""; best6=""
+	for u in $(enabled_sorted); do
+		# 两族都有人了就不用再往下探
+		[ -n "$best4" ] && [ -n "$best6" ] && break
+
+		if usable "$u"; then
+			:
+		elif has_addr "$(dev_of "$u")"; then
+			# 有地址但探测不通，这不是"接口没起来"的问题，别 ifup；
+			# 也避免同一轮探测两次、失败计数加两次。
+			continue
+		elif bring_up "$u" && usable "$u"; then
+			:
+		else
+			continue
+		fi
+
+		if [ -z "$best4" ] && has_family 4 "$u" && can_route 4 "$u"; then best4="$u"; fi
+		if [ -z "$best6" ] && has_family 6 "$u" && can_route 6 "$u"; then best6="$u"; fi
+	done
+
+	apply_family 4 "$best4"
+	apply_family 6 "$best6"
+
+	[ -n "$best4" ] || [ -n "$best6" ] || return 1
+	return 0
+}
+
+# ---------- 帮助 ----------
+usage() {
+	cat <<'USAGE'
+mwanx - 多出口优先级管理与故障切换
+
+用法: mwanx <命令> [参数...]
+      mwanx help <命令>     查看某个命令的详细说明
+
+查看
+  list                  列出所有出口及健康状态
+  status                当前生效的出口与默认路由
+  check                 手动跑一次选路
+
+管理
+  add <名> --device <设备> --iface <network接口> [--order N]
+  del <名>              删除出口
+  enable <名>           启用出口
+  disable <名>          停用出口
+  order <名> <N>        调整优先级，数字越小越优先
+  sync-metrics          把 order 同步到 network.<iface>.metric
+  reload-network        重载 network，让 metric 生效（所有出口会短暂中断）
+
+运行
+  loop                  常驻轮询（由 init 脚本调用）
+  auto                  清覆盖路由并立刻重新选路
+  clear                 只清覆盖路由，不动配置
+  fail <network接口>    强判某出口故障并立刻重选（hotplug 钩子用）
+  autoadd               扫一遍防火墙 wan 区，把没纳管的接口加成出口
+
+配置
+  /etc/config/mwanx    改完执行 /etc/init.d/mwanx restart
+
+示例
+  mwanx status
+  mwanx add usb0 --device usb0 --iface usb0 --order 30
+  mwanx order wwan10 15
+USAGE
+}
+
+help_topic() {
+	case "$1" in
+	list)
+		cat <<'EOF'
+mwanx list - 列出所有出口
+
+每个出口一行，含当前 order、是否启用、设备名、实时健康、是否生效。
+健康检测是即时探测（1 个包 / 1 秒超时），不会影响 fail_threshold 计数。
+
+  NAME    出口名（配置里的段名）
+  ORDER   优先级，越小越优先
+  ENABLED 1=参与选路，no=不参与
+  DEVICE  L3 设备名，探针绑的就是它
+  HEALTH  up / DOWN / -（未启用时不探测）
+  ACTIVE  <- active 表示当前正在承载流量
+EOF
+		;;
+	status)
+		cat <<'EOF'
+mwanx status - 当前状态
+
+输出当前生效的出口，以及主路由表里的默认路由（含 mwanx 插的那条覆盖路由）。
+排查切换没生效时看这里最直接。
+EOF
+		;;
+	check)
+		cat <<'EOF'
+mwanx check - 手动跑一次选路
+
+按 order 从前往后找第一个可用出口，变了就换覆盖路由。
+正常由 loop 自动调用。手动执行可用来立即触发重选，不用等下一轮。
+EOF
+		;;
+	add)
+		cat <<'EOF'
+mwanx add <名> --device <设备> --iface <network接口> [--order N]
+
+新增一个出口。
+
+  --device   实际 L3 设备名，如 eth1 / phy0-sta0 / usb0。必填。
+  --iface    对应 network.<iface>，失败时用它 ifup。省略则同名。
+  --order    优先级，越小越优先。省略为 99。
+
+设备名怎么查：
+  ip link                    看有哪些网卡
+  ip -4 addr                 看哪个拿到了 IP
+
+例子（手机 USB 共享）:
+  ip link                                 确认设备名，通常是 usb0
+  在 /etc/config/network 里建好对应 interface（proto dhcp）
+  mwanx add usb0 --device usb0 --iface usb0 --order 30
+
+注意：add 只写 mwanx 自己的配置。若想让 network 的 metric 也一起对齐，
+      再跑 mwanx sync-metrics。
+EOF
+		;;
+	del)
+		cat <<'EOF'
+mwanx del <名> - 删除出口
+
+只删配置，不动 system 里任何东西。
+正在承载流量的出口不允许删除，先用 mwanx order 把它调后，或
+mwanx disable 停用等切换过去之后再删。
+EOF
+		;;
+	enable|disable)
+		cat <<'EOF'
+mwanx enable  <名>   - 让该出口参与选路
+mwanx disable <名>   - 让它不参与选路
+
+停用后 loop 会跳过它。如果停用的正好是当前生效的出口，
+下一个循环会自动切到排在最前面的可用出口。
+EOF
+		;;
+	order)
+		cat <<'EOF'
+mwanx order <名> <N> - 调整优先级
+
+数字越小越优先。典型顺序：
+  wan(10)  <  usb(20)  <  wwan10(30)
+
+改完下一个循环就生效，不用重启。
+注意 override_metric 必须严格小于所有 order，否则启动时会被拒绝。
+EOF
+		;;
+	sync-metrics)
+		cat <<'EOF'
+mwanx sync-metrics - 把 order 同步到 network 的 metric   【部署必做】
+
+把每个启用出口的 order 写进 network.<iface>.metric 并 commit（不 reload）。
+
+这不是可选项。netifd 默认以 metric 0 安装默认路由，而 mwanx 的覆盖路由用的是
+override_metric（默认 1）—— 不设 metric 的话覆盖路由竞争不过 netifd 自己那条，
+切换会静默失效。mwanx 启动时会校验，不满足就拒绝启动。
+
+顺带的好处：万一 mwanx 没在跑，netifd 按 metric 选出的顺序也符合预期。
+
+写完必须执行 /etc/init.d/network reload 才生效。
+EOF
+		;;
+	reload-network)
+		cat <<'EOF'
+mwanx reload-network - 重载 network，让 metric 生效
+
+sync-metrics 只写配置不 reload，写完得让 netifd 重装一次路由才生效 —— 这个命令
+就是干这个的，等价于 /etc/init.d/network reload（额外把 reloading 标志置上，
+让选路循环跳过一轮，免得和 netifd 重装 metric 0 路由的动作赛跑）。
+
+代价是 netifd 会重装所有接口的路由，所有出口都会短暂中断。没有更轻的办法：
+单条 ifup 只救得了一个接口，而 metric 变了的是全部。
+
+重载时 mwanx 的覆盖路由也会一并被清掉，由 netifd 按 metric 先顶着，下一个
+选路循环会装回来。想立刻装回来就接着跑一次 mwanx check。
+EOF
+		;;
+	loop)
+		cat <<'EOF'
+mwanx loop - 常驻轮询
+
+按 globals.interval 秒一轮，每轮跑一次选路。由 /etc/init.d/mwanx 启动，
+procd 会在它退出时自动拉起。一般不需要手动调用。
+
+前台调试可以 ctrl-c 中断。
+EOF
+		;;
+	auto)
+		cat <<'EOF'
+mwanx auto - 清掉覆盖路由并立刻重新选路
+
+相当于 clear + check，用于手动干预后让状态归位。
+执行前会先做配置自检。
+EOF
+		;;
+	fail)
+		cat <<'EOF'
+mwanx fail <network接口名> - 强制把某出口判为故障并立刻重选
+
+主要给 hotplug 钩子调用，一般不用手动执行。参数是 network 接口名
+（如 wan、wwan10），不是出口名。
+
+存在的原因：usable() 有防抖，当前出口在攒够 fail_threshold 次失败之前
+仍会被认为可用。但 netifd 报的 ifdown/disconnected 是确定性事件，
+没有理由再等 —— 这个命令把失败计数直接顶到阈值再立刻选一次。
+
+手动可用来模拟某条出口掉线，验证切换。
+EOF
+		;;
+	clear)
+		cat <<'EOF'
+mwanx clear - 只清覆盖路由
+
+删掉 mwanx 插的那条（metric = override_metric）默认路由，让 netifd
+自己的默认路由接管。不停服务、不改配置。
+
+init 脚本的 stop 会调用它，避免停止后留下一条指向失效网关的僵尸路由。
+EOF
+		;;
+	autoadd)
+		cat <<'EOF'
+mwanx autoadd - 扫描并自动纳管新出口
+
+扫一遍防火墙 wan 区的接口，把还没被纳管的加成出口，排在优先级最后
+（order = 现有最大值 + 10），不影响你手动排好的顺序。
+
+准入条件（缺一不可）：
+  · 接口在自己的配置里属于防火墙的 wan 区
+  · 当前拿到了 IPv4 地址 —— 纯 IPv6 的接口（wan6 / 6in4 / 6to4）同样挂在
+    wan 区，不加这一条会被错误地当成出口，等于加了一条永远不通的死链路
+  · 还没有任何出口的 iface 指向它
+
+纳管时会同时把 network.<iface>.metric 写成新的 order。不写的话 netifd 会以
+metric 0 装默认路由，压过 mwanx 的覆盖路由，选择会静默失效。
+
+这个命令由守护进程循环按 globals.autoadd_interval 秒自动调用，一般不用手跑。
+由 globals.auto_add 控制开关（缺省为开）。
+EOF
+		;;
+	help|-h|--help)
+		usage
+		;;
+	*)
+		echo "mwanx: 没有 '$1' 的帮助"; echo
+		usage
+		return 1
+		;;
+	esac
+}
+
+cmd_list() {
+	printf '%-10s %-6s %-8s %-14s %-6s %-8s %s\n' NAME ORDER ENABLED DEVICE FAMILY HEALTH ACTIVE
+	for u in $(all_sorted); do
+		o=$(order_of "$u"); e=$(uci -q get "mwanx.$u.enabled")
+		d=$(dev_of "$u")
+		f=$(family_of "$u"); [ -n "$f" ] || f=-
+		if [ "$e" = "1" ]; then
+			probe "$u" 1 1 && h=up || h=DOWN
+		else
+			h=-
+		fi
+		act=""
+		[ "$u" = "$(active4)" ] && act="v4"
+		[ "$u" = "$(active6)" ] && act="${act:+$act+}v6"
+		a=""; [ -n "$act" ] && a="<- $act"
+		[ "$e" = "1" ] || e=no
+		printf '%-10s %-6s %-8s %-14s %-6s %-8s %s\n' "$u" "$o" "$e" "$d" "$f" "$h" "$a"
+	done
+}
+
+cmd_status() {
+	printf 'active v4 : %s\n' "$(active4)"
+	printf 'active v6 : %s\n' "$(active6)"
+	printf 'override v4 route: '
+	ip route show default 2>/dev/null | grep -E "metric $(ovr_metric)( |$)" | tr '\n' ' '
+	echo
+	printf 'override v6 route: '
+	ip -6 route show default 2>/dev/null | grep -E "metric $(ovr_metric)( |$)" | tr '\n' ' '
+	echo
+	printf 'default routes in main table (v4):\n'
+	ip route show default
+	printf 'default routes in main table (v6):\n'
+	ip -6 route show default 2>/dev/null
+}
+
+cmd_add() {
+	name=$1; shift
+	[ -n "$name" ] || { usage; exit 1; }
+	[ "$(uci -q get "mwanx.$name")" = "uplink" ] && { echo "mwanx: $name 已存在"; exit 1; }
+
+	dev=""; ifc=""; ord=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--device) dev=$2; shift 2 ;;
+			--iface)  ifc=$2; shift 2 ;;
+			--order)  ord=$2; shift 2 ;;
+			*) echo "mwanx: 未知参数 $1"; exit 1 ;;
+		esac
+	done
+	[ -n "$dev" ] || { echo "mwanx: --device 必填"; exit 1; }
+	[ -n "$ifc" ] || ifc=$name
+	[ -n "$ord" ] || ord=99
+
+	uci set "mwanx.$name=uplink"
+	uci set "mwanx.$name.enabled=1"
+	uci set "mwanx.$name.device=$dev"
+	uci set "mwanx.$name.iface=$ifc"
+	uci set "mwanx.$name.order=$ord"
+	uci set "mwanx.$name.test_ip=$(conf test_ip)"
+	uci commit mwanx
+	echo "mwanx: 已添加 $name (device=$dev iface=$ifc order=$ord)"
+	echo "提示：确认 network.$ifc 存在后用 mwanx sync-metrics 对齐 metric"
+}
+
+cmd_del() {
+	u=$1
+	[ "$(uci -q get "mwanx.$u")" = "uplink" ] || { echo "mwanx: $u 不存在"; exit 1; }
+	[ "$u" = "$(active4)" ] && { echo "mwanx: $u 正在 v4 生效，先切走再删"; exit 1; }
+	[ "$u" = "$(active6)" ] && { echo "mwanx: $u 正在 v6 生效，先切走再删"; exit 1; }
+	uci -q delete "mwanx.$u"
+	uci commit mwanx
+	echo "mwanx: 已删除 $u"
+}
+
+cmd_enable()  { u=$1; uci set "mwanx.$u.enabled=1"; uci commit mwanx; echo "mwanx: $u enabled"; }
+cmd_disable() { u=$1; uci set "mwanx.$u.enabled=0"; uci commit mwanx; echo "mwanx: $u disabled"; }
+
+cmd_order() {
+	u=$1; n=$2
+	[ -n "$u" ] && [ -n "$n" ] || { usage; exit 1; }
+	uci set "mwanx.$u.order=$n"
+	uci commit mwanx
+	echo "mwanx: $u order -> $n"
+}
+
+# 把 order 同步成 network 接口的 metric。
+# 只影响"守护进程挂掉时"的降级行为，正常运行时覆盖路由说了算。
+cmd_sync_metrics() {
+	for u in $(enabled_sorted); do
+		i=$(iface_of "$u"); o=$(order_of "$u")
+		[ -n "$i" ] && [ -n "$o" ] || continue
+		uci -q get "network.$i" >/dev/null 2>&1 || {
+			echo "  skip $u: network.$i 不存在"
+			continue
+		}
+		uci set "network.$i.metric=$o"
+		echo "  network.$i.metric -> $o"
+	done
+	uci commit network
+	echo "已写入，执行 /etc/init.d/network reload 生效"
+}
+
+# 重载 network，让上面写进 network.<iface>.metric 的改动真正生效。
+# 顺带把 reloading 标志置上：选路循环看到它就跳过一轮，免得和 netifd 重装
+# metric 0 路由的动作赛跑（和 cmd_autoadd 里 metric_apply=reload 的处理一致）。
+# 刻意不加锁 —— 持锁做重载会把 netifd 卡住，理由见 cmd_autoadd 的注释。
+cmd_reload_network() {
+	log "reloading network to apply metrics (all uplinks will briefly drop)"
+	echo 1 > "$STATE_DIR/reloading"
+	/etc/init.d/network reload
+}
+
+cmd_auto() {
+	validate_config || { echo "mwanx: 配置有误，已中止"; exit 1; }
+	with_lock cmd_reselect
+	cmd_status
+}
+
+# 撤两族的覆盖路由 + 清状态。三步必须原子，否则和守护进程/hotplug 交错会留下空的 active。
+clear_all_routes() { clear_route4; clear_active4; clear_route6; clear_active6; }
+
+cmd_reselect() { clear_all_routes; do_check; }
+
+cmd_clear() { with_lock clear_all_routes; echo "mwanx: 覆盖路由已清除（v4 和 v6）"; }
+
+# 由 hotplug 调用：netifd 报告某接口 down 是确定性事件，不该再等防抖攒够次数
+# （usable 的粘滞规则会让当前出口在阈值内"看起来还行"）。直接把失败计数顶到
+# 阈值，然后立刻重选。参数是 network 接口名，不是出口名。
+cmd_fail() {
+	target=$1
+	[ -n "$target" ] || { usage; exit 1; }
+	hit=0
+	for u in $(uplink_names); do
+		[ "$(iface_of "$u")" = "$target" ] || continue
+		hit=1
+		echo "$(threshold)" > "$STATE_DIR/fail.$u"
+		log "hotplug: $target ($u) reported down, forcing fail count to threshold"
+	done
+	[ "$hit" = "1" ] || exit 0
+	# 只做路由决策，绝不拉起接口：这里跑在 netifd 的事件处理上下文里
+	NO_BRINGUP=1
+	# 抢不到锁就放弃 —— 等锁等于卡住 netifd，而守护进程 2 秒内就会自己重选
+	LOCK_TRIES=2
+	with_lock do_check
+}
+
+# ---------- 自动纳管 ----------
+
+# 防火墙 wan 区的接口名。zone 是匿名段，没有别的办法拿到，只能这么找。
+wan_zone_ifaces() {
+	z=$(uci show firewall 2>/dev/null | sed -n "s/^firewall\.\([^.=]*\)\.name=.wan.$/\1/p")
+	[ -n "$z" ] || return 0
+	uci -q get "firewall.$z.network"
+}
+
+# 按天清理持久化日志。
+# 日志量极稀疏（十几小时十几行），整文件重写完全划算，不必考虑 flash 磨损。
+prune_log() {
+	[ "$(conf log_persist)" = "1" ] || return 0
+	f=$(log_file)
+	[ -f "$f" ] || return 0
+
+	# 每天最多清一次
+	[ -f "$STATE_DIR/prune.$(date '+%Y%m%d')" ] && return 0
+
+	days=$(log_days)
+	cutoff=$(date -d "-$days days" '+%Y-%m-%d' 2>/dev/null)
+	# busybox 的 date -d 万一不支持，退回 epoch 运算
+	if [ -z "$cutoff" ]; then
+		cutoff=$(date -d "@$(( $(date +%s) - days * 86400 ))" '+%Y-%m-%d' 2>/dev/null)
+	fi
+	[ -n "$cutoff" ] || return 0
+
+	# 行首就是 YYYY-MM-DD，字典序即时间序
+	if awk -v c="$cutoff" 'substr($0,1,10) >= c' "$f" > "$f.tmp" 2>/dev/null; then
+		mv "$f.tmp" "$f"
+	else
+		rm -f "$f.tmp"
+	fi
+
+	rm -f "$STATE_DIR"/prune.* 2>/dev/null
+	: > "$STATE_DIR/prune.$(date '+%Y%m%d')"
+	log "log pruned, keeping $days days"
+}
+
+# 把防火墙 wan 区里、还没纳管的接口加成出口。
+#
+# 调用点只有守护进程循环 —— 不挂 hotplug。hotplug 跑在 netifd 的事件上下文里
+# （那正是 NO_BRINGUP 存在的原因），从那里写 network 配置再触发重载会重入 netifd。
+cmd_autoadd() {
+	auto_add_on || return 0
+
+	# 节流：新接口晚十几秒纳管无所谓，不必每轮都扫
+	f="$STATE_DIR/autoadd.ts"
+	now=$(cut -d. -f1 /proc/uptime)
+	last=$(cat "$f" 2>/dev/null || echo 0)
+	[ $((now - last)) -lt "$AUTOADD_INTERVAL" ] && return 0
+	echo "$now" > "$f"
+
+	# 扫描和写 UCI 放锁里 —— 这块会和前端保存配置互相覆盖
+	AUTOADD_NEW=""
+	with_lock cmd_autoadd_scan
+	[ -n "$AUTOADD_NEW" ] || return 0
+
+	# 应用动作放锁外。metric_apply=reload 会触发 netifd 事件，而 hotplug 钩子
+	# 会来抢同一把锁 —— 持锁做重载等于把 netifd 卡住。
+	case "$(metric_apply)" in
+		reload)
+			log "reloading network to apply metrics (all uplinks will briefly drop)"
+			echo 1 > "$STATE_DIR/reloading"
+			/etc/init.d/network reload >/dev/null 2>&1
+			;;
+		ifup)
+			for i in $AUTOADD_NEW; do
+				log "ifup $i to apply its metric"
+				ifup "$i" >/dev/null 2>&1
+			done
+			;;
+		*)
+			log "metric written to config but not applied yet"
+			;;
+	esac
+	return 0
+}
+
+# 扫描 + 写配置，必须在锁内跑。结果通过 AUTOADD_NEW 回传（同一 shell，变量可见）。
+cmd_autoadd_scan() {
+	AUTOADD_NEW=""
+
+	# 已纳管的 iface 集合 —— 按 iface 去重而不是段名，段名和 iface 可能不同
+	used=" "
+	for u in $(uplink_names); do
+		i=$(iface_of "$u")
+		[ -n "$i" ] && used="$used$i "
+	done
+
+	# 现有最大 order（含 disabled），新加的往后排
+	max=0
+	for u in $(uplink_names); do
+		o=$(order_of "$u")
+		if [ -n "$o" ] && [ "$o" -gt "$max" ] 2>/dev/null; then
+			max=$o
+		fi
+	done
+
+	for i in $(wan_zone_ifaces); do
+		case "$used" in *" $i "*) continue ;; esac
+
+		st=$(ubus call "network.interface.$i" status 2>/dev/null)
+		[ -n "$st" ] || continue
+
+		# 必须拿到 IPv4 地址才纳管。
+		# 这一条是关键：wan6 / 6in4 / 6to4 同样挂在 wan 区，
+		# 少了它就会把纯 IPv6 接口错误地当成出口加成一条死链路。
+		echo "$st" | sed -n '/"ipv4-address"/,/]/p' | grep -q '"address"' || continue
+
+		# down 的接口没有 l3_device，回退到配置里的 device
+		d=$(echo "$st" | sed -n 's/.*"l3_device": *"\([^"]*\)".*/\1/p' | head -1)
+		[ -n "$d" ] || d=$(uci -q get "network.$i.device")
+		[ -n "$d" ] || continue
+
+		max=$((max + 10))
+		uci set "mwanx.$i=uplink"
+		uci set "mwanx.$i.enabled=1"
+		uci set "mwanx.$i.order=$max"
+		uci set "mwanx.$i.iface=$i"
+		uci set "mwanx.$i.device=$d"
+		uci set "mwanx.$i.test_ip=$(conf test_ip)"
+		uci commit mwanx
+
+		# 同一趟把 network 的 metric 也写上。不写的话 netifd 会以 metric 0
+		# 装默认路由，压过覆盖路由（metric 1），选择会静默失效。
+		if uci -q get "network.$i" >/dev/null 2>&1; then
+			uci set "network.$i.metric=$max"
+			uci commit network
+		fi
+
+		log "auto-added uplink $i (device $d, order $max, placed last)"
+		AUTOADD_NEW="$AUTOADD_NEW $i"
+	done
+	return 0
+}
+
+cmd_loop() {
+	validate_config || { log "invalid config, refusing to start"; exit 1; }
+	log "mwanx started (interval=$(interval)s threshold=$(threshold))"
+	prune_log
+
+	while :; do
+		# 上一轮触发了 network reload，netifd 正在重装路由 —— 这一轮先不选路，
+		# 否则会和它重装 metric 0 路由的动作赛跑
+		if [ -f "$STATE_DIR/reloading" ]; then
+			rm -f "$STATE_DIR/reloading"
+			sleep 3
+			continue
+		fi
+
+		cmd_autoadd
+		with_lock do_check
+		sleep "$(interval)"
+	done
+}
+
+# 任何命令后面跟 -h / --help，都显示该命令的详细帮助
+for _a in "$@"; do
+	case "$_a" in
+		-h|--help) help_topic "${1:-}"; exit 0 ;;
+	esac
+done
+
+case "${1:-}" in
+	'')           usage ;;
+	help|-h|--help)
+	              if [ -n "${2:-}" ]; then help_topic "$2"; else usage; fi ;;
+	list)         cmd_list ;;
+	status)       cmd_status ;;
+	check)        with_lock do_check ;;
+	autoadd)      cmd_autoadd ;;
+	add)          shift; cmd_add "$@" ;;
+	del)          [ -n "${2:-}" ] || { help_topic del; exit 1; };      cmd_del "$2" ;;
+	enable)       [ -n "${2:-}" ] || { help_topic enable; exit 1; };   cmd_enable "$2" ;;
+	disable)      [ -n "${2:-}" ] || { help_topic disable; exit 1; };  cmd_disable "$2" ;;
+	order)        [ -n "${2:-}" ] && [ -n "${3:-}" ] || { help_topic order; exit 1; }
+	              cmd_order "$2" "$3" ;;
+	sync-metrics) cmd_sync_metrics ;;
+	reload-network) cmd_reload_network ;;
+	fail)         [ -n "${2:-}" ] || { help_topic fail; exit 1; };     cmd_fail "$2" ;;
+	loop)         cmd_loop ;;
+	auto)         cmd_auto ;;
+	clear)        cmd_clear ;;
+	*) echo "mwanx: 未知命令 $1"; echo; echo "试试: mwanx help"; exit 1 ;;
+esac

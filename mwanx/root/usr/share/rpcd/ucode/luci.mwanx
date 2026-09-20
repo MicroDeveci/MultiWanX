@@ -1,0 +1,316 @@
+#!/usr/bin/ucode
+
+'use strict';
+
+/*
+ * luci.mwanx - mwanx 的 rpcd 后端
+ *
+ * 设计取向：薄封装。判断逻辑一概不重复实现，只做两件事 ——
+ *   1. 读 /etc/config/mwanx 和 /tmp/mwanx 的状态
+ *   2. 把 mwanx CLI 的输出转成 JSON
+ *
+ * 健康探测照抄 mwanx 本体的语义：设备必须有 IPv4 地址，再用 -I 绑源设备 ping
+ * 测活目标。必须绑设备 —— 不绑的话探测包会被 fwmark 策略路由劫持，
+ * 测出来的是代理链路通不通，不是这条出口通不通。
+ */
+
+import { popen } from 'fs';
+
+const MWANX = '/usr/bin/mwanx';
+const ACTIVE4 = '/tmp/mwanx/active4';
+const ACTIVE6 = '/tmp/mwanx/active6';
+
+/* 跑一条命令，同时拿输出和退出码 */
+function run(cmd) {
+	let fd = popen(cmd);
+	let o = fd.read('all');
+	let rc = fd.close();
+	if (o == null) o = '';
+	return { out: o, rc: rc };
+}
+
+function out(cmd) { return run(cmd).out; }
+
+/* 单引号包裹，防注入 */
+function q(s) {
+	return "'" + replace(s, "'", "'\\''") + "'";
+}
+
+function uci_get(path) {
+	return trim(out("uci -q get " + q('mwanx.' + path) + " 2>/dev/null"));
+}
+
+function uplink_names() {
+	let r = out("uci -q show mwanx 2>/dev/null | sed -n 's/^mwanx\\.\\([^.=]*\\)=uplink$/\\1/p'");
+	let parts = split(trim(r), '\n');
+	let names = [];
+	for (let i = 0; i < length(parts); i++) {
+		let n = trim(parts[i]);
+		if (length(n)) push(names, n);
+	}
+	return names;
+}
+
+/* v6 必须限定 scope global —— 任何 up 的接口都挂着 fe80:: 链路本地地址，
+   不排除的话纯 v4 接口会被误判成双栈。 */
+function has_ip4(dev) {
+	if (!length(dev)) return false;
+	return run("ip -4 addr show " + q(dev) + " 2>/dev/null | grep -q 'inet '").rc == 0;
+}
+function has_ip6(dev) {
+	if (!length(dev)) return false;
+	return run("ip -6 addr show " + q(dev) + " scope global 2>/dev/null | grep -q 'inet6 '").rc == 0;
+}
+
+/* 出口带哪几族："4" / "6" / "46"，都没地址返回空串 */
+function family_of(section) {
+	let d = uci_get(section + '.device');
+	if (!length(d)) return '';
+	let f = '';
+	if (has_ip4(d)) f = '4';
+	if (has_ip6(d)) f += '6';
+	return f;
+}
+
+/* 与 mwanx 本体一致的探测语义：按出口实际带的族选目标和命令。
+   双栈出口只探 v4（v4 是主）。必须 -I 绑源设备，否则探测包会被策略路由劫持。 */
+function probe(section) {
+	let dev = uci_get(section + '.device');
+	if (!length(dev)) return false;
+
+	if (has_ip4(dev)) {
+		let t = uci_get(section + '.test_ip');
+		if (!length(t)) t = uci_get('globals.test_ip');
+		if (!length(t)) return false;
+		return run("ping -I " + q(dev) + " -c 1 -W 1 " + q(t) + " >/dev/null 2>&1").rc == 0;
+	}
+
+	if (has_ip6(dev)) {
+		let t = uci_get(section + '.test_ip6');
+		if (!length(t)) t = uci_get('globals.test_ip6');
+		if (!length(t)) t = '2400:3200::1';
+		return run("ping6 -I " + q(dev) + " -c 1 -W 1 " + q(t) + " >/dev/null 2>&1").rc == 0;
+	}
+
+	return false;
+}
+
+const methods = {
+
+	/* 运行时状态：当前生效出口 + 各出口实时健康。
+	   配置本身前端直接走 uci 模块读，这里只管"活的"那部分。 */
+	status: {
+		call: function() {
+			let names = uplink_names();
+			let up = {};
+			let fam = {};
+
+			for (let i = 0; i < length(names); i++) {
+				let n = names[i];
+				let enabled = uci_get(n + '.enabled') == '1';
+				up[n] = (enabled && probe(n)) ? 1 : 0;
+				fam[n] = family_of(n);
+			}
+
+			let a4 = trim(out("cat " + q(ACTIVE4) + " 2>/dev/null"));
+			let a6 = trim(out("cat " + q(ACTIVE6) + " 2>/dev/null"));
+
+			return {
+				active: a4,          /* 兼容旧字段：v4 的生效出口 */
+				active4: a4,
+				active6: a6,
+				order: names,
+				up: up,
+				family: fam
+			};
+		}
+	},
+
+	/* 列出候选接口供用户挑。
+	   刻意不做区域过滤，全部列出来由用户自己判断。
+	   只标出哪些属于 wan 区、哪些已经在用，让前端自己决定怎么呈现。 */
+	scan: {
+		call: function() {
+			let dump = null;
+			try { dump = json(out("ubus call network.interface dump 2>/dev/null")); }
+			catch (e) { dump = null; }
+			if (type(dump) != 'object' || type(dump.interface) != 'array')
+				return { interfaces: [] };
+
+			/* 已被纳管的 iface 集合（按 iface 去重，段名可能和 iface 不同） */
+			let used = {};
+			let names = uplink_names();
+			for (let i = 0; i < length(names); i++) {
+				let f = uci_get(names[i] + '.iface');
+				if (length(f)) used[f] = true;
+			}
+
+			/* 防火墙 wan 区成员 */
+			let wan = {};
+			let z = trim(out("uci show firewall 2>/dev/null | sed -n " +
+				"\"s/^firewall\\.\\([^.=]*\\)\\.name=.wan.$/\\1/p\""));
+			if (length(z)) {
+				let mem = split(trim(out("uci -q get " + q('firewall.' + z + '.network') + " 2>/dev/null")), ' ');
+				for (let i = 0; i < length(mem); i++)
+					if (length(mem[i])) wan[mem[i]] = true;
+			}
+
+			let list = [];
+			let arr = dump.interface;
+			for (let i = 0; i < length(arr); i++) {
+				let it = arr[i];
+				let name = it.interface;
+				if (!length(name)) continue;
+
+				/* down 的接口没有 l3_device，回退到配置里的 device */
+				let dev = it.l3_device;
+				if (type(dev) != 'string' || !length(dev)) dev = it.device;
+				if (type(dev) != 'string') dev = '';
+
+				let addrs = [];
+				if (type(it['ipv4-address']) == 'array') {
+					for (let j = 0; j < length(it['ipv4-address']); j++) {
+						let a = it['ipv4-address'][j].address;
+						if (length(a)) push(addrs, a);
+					}
+				}
+
+				let addrs6 = [];
+				if (type(it['ipv6-address']) == 'array') {
+					for (let j = 0; j < length(it['ipv6-address']); j++) {
+						let a = it['ipv6-address'][j].address;
+						/* 排除 fe80:: 链路本地 —— 每个 up 的接口都有，不是可用的出口地址 */
+						if (length(a) && index(a, 'fe80') != 0) push(addrs6, a);
+					}
+				}
+
+				let fam = '';
+				if (length(addrs)) fam = '4';
+				if (length(addrs6)) fam += '6';
+
+				push(list, {
+					name: name,
+					device: dev,
+					up: it.up ? 1 : 0,
+					addr4: join(', ', addrs),
+					addr6: join(', ', addrs6),
+					family: fam,
+					in_wan_zone: wan[name] ? 1 : 0,
+					is_uplink: used[name] ? 1 : 0,
+					/* 有设备名、且还没被纳管就能添加。
+					   刻意不再要求 IPv4 —— 用户要能把 wan6 这类 IPv6 单栈接口
+					   手动加成出口（mwanx 现在按族分别装路由）。
+					   注意自动纳管仍然只认 IPv4，两者是有意分开的：
+					   自动扫进来的东西必须保证真能用，手动添加则由用户自己判断。 */
+					addable: (!used[name] && length(dev)) ? 1 : 0
+				});
+			}
+			return { interfaces: list };
+		}
+	},
+
+	/* 添加出口。转调 CLI —— 校验、test_ip 默认值、commit 都在那边，不在 JS 里重实现。 */
+	add_uplink: {
+		args: { name: '', device: '', iface: '' },
+		call: function(request) {
+			let name = request.args.name;
+			let dev = request.args.device;
+			if (!length(name) || !length(dev))
+				return { rc: 2, out: '缺少 name 或 device' };
+			let ifc = request.args.iface;
+			if (!length(ifc)) ifc = name;
+			let r = run(q(MWANX) + " add " + q(name) +
+				" --device " + q(dev) + " --iface " + q(ifc) + " 2>&1");
+			return { rc: r.rc, out: trim(r.out) };
+		}
+	},
+
+	/* 手动触发一次自动纳管（设置里打开开关后可以让它立刻生效） */
+	autoadd: {
+		call: function() {
+			let r = run(q(MWANX) + " autoadd 2>&1");
+			return { rc: r.rc, out: trim(r.out) };
+		}
+	},
+
+	/* 立即重选一次 */
+	check: {
+		call: function() {
+			let r = run(q(MWANX) + " check 2>&1");
+			return { rc: r.rc, out: trim(r.out) };
+		}
+	},
+
+	/* 把 order 同步到 network.<iface>.metric。
+	   注意：这一步会改 /etc/config/network，但仍然需要 reload network 才生效，
+	   所以只 commit，不自动 reload —— 由用户在界面上确认后再手动执行。 */
+	sync_metrics: {
+		call: function() {
+			let r = run(q(MWANX) + " sync-metrics 2>&1");
+			return { rc: r.rc, out: trim(r.out) };
+		}
+	},
+
+	/* 重载 network，让上一步写进去的 metric 真正生效。
+	   只是转调 CLI —— 置 reloading 标志、刻意放锁外这些讲究都在那边。 */
+	reload_network: {
+		call: function() {
+			let r = run(q(MWANX) + " reload-network 2>&1");
+			return { rc: r.rc, out: trim(r.out) };
+		}
+	},
+
+	/* 清掉覆盖路由，交给 netifd 自己的默认路由 */
+	clear: {
+		call: function() {
+			let r = run(q(MWANX) + " clear 2>&1");
+			return { rc: r.rc, out: trim(r.out) };
+		}
+	},
+
+	/* 日志：只取 mwanx 自己的行。
+	   args 里的值是「默认值/示例值」，不是类型名 —— 写 0 才表示数字，
+	   写成 'int' 会被当成"默认值为 int 的字符串"。 */
+	logs: {
+		args: { lines: 0 },
+		call: function(request) {
+			let n = request.args.lines || 200;
+			if (n < 20) n = 20;
+			if (n > 2000) n = 2000;
+
+			/* 持久化开着就优先读文件：它含重启前的历史，是 logread 的超集，
+			   不需要两边合并。文件为空（刚开始记）才退回 logread。 */
+			if (uci_get('globals.log_persist') == '1') {
+				let f = uci_get('globals.log_file');
+				if (!length(f)) f = '/srv/mwanx/mwanx.log';
+				let t = out("tail -n " + n + " " + q(f) + " 2>/dev/null");
+				if (length(trim(t)))
+					return { text: t, source: 'file' };
+			}
+			return { text: out("logread 2>/dev/null | grep mwanx | tail -n " + n), source: 'logread' };
+		}
+	},
+
+	/* 导出当前配置，供前端存成备份文件 */
+	backup: {
+		call: function() {
+			return { text: out("uci export mwanx 2>/dev/null") };
+		}
+	},
+
+	/* 整份恢复出厂：用包里那份原始配置覆盖，出口段一并清掉。
+	   那份副本在 /usr/share/mwanx/mwanx.default，不受 conffile 保护。
+	   先删 uci 的增量文件，否则旧 delta 会盖在刚拷进去的默认值上；
+	   再让 rpcd 丢掉内存里的那份，不然它还会拿旧内容应答前端。 */
+	restore_defaults: {
+		call: function() {
+			let r = run("rm -f /tmp/.uci/mwanx && cp /usr/share/mwanx/mwanx.default /etc/config/mwanx 2>&1");
+			if (r.rc)
+				return { rc: r.rc, out: trim(r.out) };
+			out("ubus call uci reload_config '{\"config\":\"mwanx\"}' 2>/dev/null");
+			return { rc: 0, out: '' };
+		}
+	}
+};
+
+return { "luci.mwanx": methods };
