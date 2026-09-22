@@ -249,7 +249,7 @@ return view.extend({
 
 		var input = E('input', {
 			'class': 'cbi-input-text',
-			'style': 'width: 12em;',
+			'style': 'width: 100%;',
 			'value': cur,
 			'placeholder': def || '(用全局默认)'
 		});
@@ -358,7 +358,7 @@ return view.extend({
 
 		if (!this.uplinks.length)
 			table.appendChild(E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td', 'colspan': this.HEAD.length, 'style': 'color: #888;' },
+				E('td', { 'class': 'td', 'colspan': this.HEAD.length, 'style': 'color: var(--text-color-low);' },
 					'暂无出口配置。')
 			]));
 	},
@@ -377,7 +377,7 @@ return view.extend({
 		   空行不给拖：拖动结尾会存一次盘，而空行会被 saveUci 丢掉。 */
 		var handle = E('td', {
 			'class': 'td',
-			'style': 'width: 24px; color: #999; ' +
+			'style': 'width: 24px; color: var(--text-color-low); ' +
 				(blank ? '' : 'cursor: grab; ') +
 				'user-select: none; -webkit-user-select: none;'
 		}, '⠿');
@@ -403,9 +403,9 @@ return view.extend({
 		tr.appendChild(E('td', { 'class': 'td' },
 			u.device
 				? E('span', {
-					'style': 'color: ' + (healthy ? 'green' : 'red') + '; font-weight: bold;'
+					'style': 'color: var(--' + (healthy ? 'success' : 'error') + '-color-high); font-weight: bold;'
 				}, healthy ? '● up' : '● DOWN')
-				: E('span', { 'style': 'color: #aaa;' }, '—')
+				: E('span', { 'style': 'color: var(--text-color-low);' }, '—')
 		));
 
 		/* 生效状态 + 启用开关 */
@@ -420,8 +420,8 @@ return view.extend({
 		});
 
 		tr.appendChild(E('td', { 'class': 'td' }, [
-			act4 ? E('span', { 'style': 'color: #0a0; font-weight: bold;' }, 'v4 ') : '',
-			act6 ? E('span', { 'style': 'color: #0a0; font-weight: bold;' }, 'v6 ') : '',
+			act4 ? E('span', { 'style': 'color: var(--success-color-high); font-weight: bold;' }, 'v4 ') : '',
+			act6 ? E('span', { 'style': 'color: var(--success-color-high); font-weight: bold;' }, 'v6 ') : '',
 			toggle
 		]));
 

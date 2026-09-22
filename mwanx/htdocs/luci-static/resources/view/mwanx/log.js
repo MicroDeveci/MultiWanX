@@ -37,7 +37,9 @@ return view.extend({
 				self.srcEl.textContent = persisted
 					? '来源：持久化文件'
 					: '来源：syslog';
-				self.srcEl.style.color = persisted ? '#070' : '#888';
+				self.srcEl.style.color = persisted
+					? 'var(--success-color-high)'
+					: 'var(--text-color-low)';
 			}
 			if (scroll)
 				self.preEl.scrollTop = self.preEl.scrollHeight;
@@ -47,10 +49,10 @@ return view.extend({
 	render: function(data) {
 		var self = this;
 
+		/* 颜色、边框、字号全交给主题的 pre 规则 —— 自己写死会在暗色主题下
+		   背景不变、字色变浅，对比度掉到 1.7 左右。这里只管高度和滚动。 */
 		this.preEl = E('pre', {
-			'style': 'max-height: 65vh; overflow: auto; font-size: 12px; ' +
-			         'line-height: 1.45; background: #f8f8f8; padding: 10px; ' +
-			         'border: 1px solid #ddd; border-radius: 3px; white-space: pre;'
+			'style': 'max-height: 65vh; overflow: auto;'
 		}, (data && data.text) ? data.text : '(暂无 mwanx 日志)');
 
 		/* 行数选择 */
@@ -91,13 +93,18 @@ return view.extend({
 			E('h2', {}, 'mwanx 运行日志'),
 			E('p', { 'class': 'cbi-value-description' }, [
 				'只显示 mwanx 自己的日志行。',
-				E('div', {}, this.srcEl)
+				this.srcEl
 			]),
 
-			E('div', { 'style': 'margin-bottom: 8px;' }, [
-				E('label', { 'style': 'margin-right: 12px;' }, [ '显示 ', sel ]),
-				E('label', { 'style': 'margin-right: 12px;' }, [ chk, ' 自动刷新（5 秒）' ]),
-				btn, ' ', btnBottom
+			/* 用 flex + wrap 排，窄屏自动折行。写成连续的 inline 元素的话，
+			   中间没有断行点，整行会被撑出容器（375px 屏实测溢出 12px）。 */
+			E('div', {
+				'style': 'display: flex; flex-wrap: wrap; align-items: center; ' +
+				         'gap: 12px; margin-bottom: 8px;'
+			}, [
+				E('label', {}, [ '显示 ', sel ]),
+				E('label', {}, [ chk, ' 自动刷新（5 秒）' ]),
+				btn, btnBottom
 			]),
 
 			this.preEl

@@ -80,7 +80,7 @@ return view.extend({
 		});
 
 		var autoRow = E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'style': 'width: 22em;' },
+			E('td', { 'class': 'td', 'style': 'width: 11em;' },
 				E('label', { 'for': 'mwanx-auto-add' },
 					[ chkAuto, ' 自动添加新接口' ])),
 			E('td', { 'class': 'td' }, desc(
@@ -179,7 +179,7 @@ return view.extend({
 		var paramRows = GPARAMS.map(function(f) {
 			var input = E('input', {
 				'class': 'cbi-input-text',
-				'style': 'width: 12em;',
+				'style': 'width: 100%;',
 				'value': self.get(f.key, '')
 			});
 			input.addEventListener('change', function() {
@@ -187,7 +187,7 @@ return view.extend({
 				self.save('已保存：' + f.label);
 			});
 			return E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td', 'style': 'width: 22em;' }, f.label),
+				E('td', { 'class': 'td', 'style': 'width: 11em;' }, f.label),
 				E('td', { 'class': 'td' }, [ input, desc(f.hint) ])
 			]);
 		});
