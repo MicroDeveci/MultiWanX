@@ -54,7 +54,7 @@ with_lock() {
 			old=$(cat "$LOCK_DIR/ts" 2>/dev/null || echo 0)
 			now=$(cut -d. -f1 /proc/uptime)
 			if [ $((now - old)) -gt 60 ]; then
-				log "lock held for $((now - old))s, taking over as stale"
+				log "stale lock detected (held $((now - old))s), taking over"
 				rm -rf "$LOCK_DIR"
 				continue
 			fi
@@ -323,7 +323,7 @@ bring_up() {
 	[ $((now - last)) -lt "$BRINGUP_COOLDOWN" ] && return 1
 	echo "$now" > "$f"
 
-	log "uplink $1: $d has no IP, ifup $i"
+	log "uplink $1: $d has no IP address, executing ifup $i"
 	ifup "$i" 2>/dev/null
 	return 1
 }
@@ -337,7 +337,7 @@ validate_config() {
 	for u in $(enabled_sorted); do
 		o=$(order_of "$u")
 		if [ "$o" = "$m" ]; then
-			log "config error: uplink $u order $o equals override_metric $m, failover would delete its real default route"
+			log "config error: uplink $u order $o equals override_metric $m, failover would delete the actual default route"
 			bad=1
 		fi
 
@@ -372,7 +372,7 @@ verify_route() {
 		got=$(ip route get "$t" 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
 	fi
 	if [ "$got" != "$want" ]; then
-		log "warning: v$fam switched to $u but traffic to $t goes via $got, override route not effective (check network.*.metric)"
+		log "warning: IPv$fam selected $u but traffic to $t traverses $got, override route not in effect (check network.*.metric)"
 	fi
 	return 0
 }
@@ -395,7 +395,7 @@ apply_family() {
 
 	if [ -z "$best" ]; then
 		if [ -n "$cur" ]; then
-			log "v$fam: no usable uplink, removing override route"
+			log "IPv$fam: no usable uplink, removing override route"
 			if [ "$fam" = "6" ]; then clear_route6; clear_active6; else clear_route4; clear_active4; fi
 		fi
 		return 1
@@ -405,14 +405,14 @@ apply_family() {
 	route_backoff "$fam" && return 1
 
 	if [ "$fam" = "6" ]; then
-		apply_route6 "$best" || { route_failed 6; log "v6 switch to $best failed (no retry for 30s)"; return 1; }
+		apply_route6 "$best" || { route_failed 6; log "IPv6 switch to $best failed (retry suppressed for 30 seconds)"; return 1; }
 		set_active6 "$best"; route_ok 6
 	else
-		apply_route4 "$best" || { route_failed 4; log "v4 switch to $best failed (no retry for 30s)"; return 1; }
+		apply_route4 "$best" || { route_failed 4; log "IPv4 switch to $best failed (retry suppressed for 30 seconds)"; return 1; }
 		set_active4 "$best"; route_ok 4
 	fi
 
-	log "v$fam switched $cur -> $best (dev $(dev_of "$best"), metric $(ovr_metric))"
+	log "IPv$fam uplink switched ${cur:-none} -> $best (device $(dev_of "$best"), metric $(ovr_metric))"
 	verify_route "$fam" "$best"
 	return 0
 }
@@ -691,8 +691,8 @@ cmd_list() {
 			h=-
 		fi
 		act=""
-		[ "$u" = "$(active4)" ] && act="v4"
-		[ "$u" = "$(active6)" ] && act="${act:+$act+}v6"
+		[ "$u" = "$(active4)" ] && act="IPv4"
+		[ "$u" = "$(active6)" ] && act="${act:+$act+}IPv6"
 		a=""; [ -n "$act" ] && a="<- $act"
 		[ "$e" = "1" ] || e=no
 		printf '%-10s %-6s %-8s %-14s %-6s %-8s %s\n' "$u" "$o" "$e" "$d" "$f" "$h" "$a"
@@ -700,17 +700,17 @@ cmd_list() {
 }
 
 cmd_status() {
-	printf 'active v4 : %s\n' "$(active4)"
-	printf 'active v6 : %s\n' "$(active6)"
-	printf 'override v4 route: '
+	printf 'active IPv4: %s\n' "$(active4)"
+	printf 'active IPv6: %s\n' "$(active6)"
+	printf 'override IPv4 route: '
 	ip route show default 2>/dev/null | grep -E "metric $(ovr_metric)( |$)" | tr '\n' ' '
 	echo
-	printf 'override v6 route: '
+	printf 'override IPv6 route: '
 	ip -6 route show default 2>/dev/null | grep -E "metric $(ovr_metric)( |$)" | tr '\n' ' '
 	echo
-	printf 'default routes in main table (v4):\n'
+	printf 'default routes in main table (IPv4):\n'
 	ip route show default
-	printf 'default routes in main table (v6):\n'
+	printf 'default routes in main table (IPv6):\n'
 	ip -6 route show default 2>/dev/null
 }
 
@@ -746,8 +746,8 @@ cmd_add() {
 cmd_del() {
 	u=$1
 	[ "$(uci -q get "mwanx.$u")" = "uplink" ] || { echo "mwanx: $u 不存在"; exit 1; }
-	[ "$u" = "$(active4)" ] && { echo "mwanx: $u 正在 v4 生效，先切走再删"; exit 1; }
-	[ "$u" = "$(active6)" ] && { echo "mwanx: $u 正在 v6 生效，先切走再删"; exit 1; }
+	[ "$u" = "$(active4)" ] && { echo "mwanx: $u is currently active for IPv4, switch away before deleting"; exit 1; }
+	[ "$u" = "$(active6)" ] && { echo "mwanx: $u is currently active for IPv6, switch away before deleting"; exit 1; }
 	uci -q delete "mwanx.$u"
 	uci commit mwanx
 	echo "mwanx: 已删除 $u"
@@ -786,7 +786,7 @@ cmd_sync_metrics() {
 # metric 0 路由的动作赛跑（和 cmd_autoadd 里 metric_apply=reload 的处理一致）。
 # 刻意不加锁 —— 持锁做重载会把 netifd 卡住，理由见 cmd_autoadd 的注释。
 cmd_reload_network() {
-	log "reloading network to apply metrics (all uplinks will briefly drop)"
+	log "reloading network to apply metrics (all uplinks will be interrupted briefly)"
 	echo 1 > "$STATE_DIR/reloading"
 	/etc/init.d/network reload
 }
@@ -802,7 +802,7 @@ clear_all_routes() { clear_route4; clear_active4; clear_route6; clear_active6; }
 
 cmd_reselect() { clear_all_routes; do_check; }
 
-cmd_clear() { with_lock clear_all_routes; echo "mwanx: 覆盖路由已清除（v4 和 v6）"; }
+cmd_clear() { with_lock clear_all_routes; echo "mwanx: override routes cleared (IPv4 and IPv6)"; }
 
 # 由 hotplug 调用：netifd 报告某接口 down 是确定性事件，不该再等防抖攒够次数
 # （usable 的粘滞规则会让当前出口在阈值内"看起来还行"）。直接把失败计数顶到
@@ -815,7 +815,7 @@ cmd_fail() {
 		[ "$(iface_of "$u")" = "$target" ] || continue
 		hit=1
 		echo "$(threshold)" > "$STATE_DIR/fail.$u"
-		log "hotplug: $target ($u) reported down, forcing fail count to threshold"
+		log "hotplug: interface $target ($u) reported down, fail count set to threshold"
 	done
 	[ "$hit" = "1" ] || exit 0
 	# 只做路由决策，绝不拉起接口：这里跑在 netifd 的事件处理上下文里
@@ -861,7 +861,7 @@ prune_log() {
 
 	rm -f "$STATE_DIR"/prune.* 2>/dev/null
 	: > "$STATE_DIR/prune.$(date '+%Y%m%d')"
-	log "log pruned, keeping $days days"
+	log "log pruned (retention: $days days)"
 }
 
 # 把防火墙 wan 区里、还没纳管的接口加成出口。
@@ -887,18 +887,18 @@ cmd_autoadd() {
 	# 会来抢同一把锁 —— 持锁做重载等于把 netifd 卡住。
 	case "$(metric_apply)" in
 		reload)
-			log "reloading network to apply metrics (all uplinks will briefly drop)"
+			log "reloading network to apply metrics (all uplinks will be interrupted briefly)"
 			echo 1 > "$STATE_DIR/reloading"
 			/etc/init.d/network reload >/dev/null 2>&1
 			;;
 		ifup)
 			for i in $AUTOADD_NEW; do
-				log "ifup $i to apply its metric"
+				log "interface $i brought up to apply metric"
 				ifup "$i" >/dev/null 2>&1
 			done
 			;;
 		*)
-			log "metric written to config but not applied yet"
+			log "metric written to configuration but not applied yet"
 			;;
 	esac
 	return 0
@@ -956,7 +956,7 @@ cmd_autoadd_scan() {
 			uci commit network
 		fi
 
-		log "auto-added uplink $i (device $d, order $max, placed last)"
+		log "auto-added uplink $i (device $d, order $max, lowest priority)"
 		AUTOADD_NEW="$AUTOADD_NEW $i"
 	done
 	return 0
@@ -964,7 +964,7 @@ cmd_autoadd_scan() {
 
 cmd_loop() {
 	validate_config || { log "invalid config, refusing to start"; exit 1; }
-	log "mwanx started (interval=$(interval)s threshold=$(threshold))"
+	log "mwanx started (interval: $(interval)s, fail threshold: $(threshold))"
 	prune_log
 
 	while :; do

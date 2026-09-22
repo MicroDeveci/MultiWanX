@@ -374,33 +374,79 @@ return view.extend({
 		var blank = this.isBlank(u);
 
 		/* 只有按在手柄上才把整行设成 draggable，否则行内输入框没法用鼠标选词。
-		   空行不给拖：拖动结尾会存一次盘，而空行会被 saveUci 丢掉。 */
+		   空行不给拖：拖动结尾会存一次盘，而空行会被 saveUci 丢掉。
+		   touch-action: none + touch 三事件是给触屏用的 —— HTML5 拖拽
+		   （dragstart 等）在触屏上不触发。触摸事件始终派发给触点起始
+		   元素，所以 move/end 挂在手柄上也能收到移出后的事件。 */
 		var handle = E('td', {
 			'class': 'td',
 			'style': 'width: 24px; color: var(--text-color-low); ' +
-				(blank ? '' : 'cursor: grab; ') +
+				(blank ? '' : 'cursor: grab; touch-action: none; ') +
 				'user-select: none; -webkit-user-select: none;'
 		}, '⠿');
 		if (!blank) {
 			handle.addEventListener('mousedown', function() { tr.draggable = true; });
 			handle.addEventListener('mouseup', function() { tr.draggable = false; });
+
+			var touchMoved = false;
+			handle.addEventListener('touchstart', function(ev) {
+				if (ev.touches.length !== 1)
+					return;
+				touchMoved = false;
+				self.dragSrc = tr;
+				tr.style.opacity = '0.4';
+				/* 置 none 让 elementFromPoint 穿过被拖行，命中它下面的落点 */
+				tr.style.pointerEvents = 'none';
+				ev.preventDefault();
+			}, { passive: false });
+
+			handle.addEventListener('touchmove', function(ev) {
+				var src = self.dragSrc;
+				if (!src)
+					return;
+				var t = ev.touches[0];
+				var el = document.elementFromPoint(t.clientX, t.clientY);
+				var row = el && el.closest ? el.closest('tr[data-uplink]') : null;
+				if (row && row !== src) {
+					var rect = row.getBoundingClientRect();
+					var after = (t.clientY - rect.top) > rect.height / 2;
+					row.parentNode.insertBefore(src, after ? row.nextSibling : row);
+					touchMoved = true;
+				}
+				ev.preventDefault();
+			}, { passive: false });
+
+			var touchEnd = function() {
+				var src = self.dragSrc;
+				if (!src)
+					return;
+				src.style.opacity = '';
+				src.style.pointerEvents = '';
+				self.dragSrc = null;
+				/* 只点一下没挪动就不存盘，免得点个手柄也弹「跃点已保存」 */
+				if (touchMoved)
+					self.persistOrder();
+			};
+			handle.addEventListener('touchend', touchEnd);
+			handle.addEventListener('touchcancel', touchEnd);
 		}
 		tr.appendChild(handle);
 
-		/* 接口 —— 下拉，选中即写 */
-		tr.appendChild(E('td', { 'class': 'td' }, this.renderIfaceSelect(u)));
+		/* 接口 —— 下拉，选中即写。data-title 是给主题窄屏卡片布局用的：
+		   600px 以下表头隐藏，列名靠 .td[data-title]::before 显示 */
+		tr.appendChild(E('td', { 'class': 'td', 'data-title': '接口' }, this.renderIfaceSelect(u)));
 
 		/* 设备 —— 只读。上面那个下拉会一起写，两个字段各说各话最容易绑错源 */
-		tr.appendChild(E('td', { 'class': 'td' }, u.device || '—'));
+		tr.appendChild(E('td', { 'class': 'td', 'data-title': '设备' }, u.device || '—'));
 
 		/* 跃点 —— order，拖动改；sync-metrics 也是读它写 network.metric */
-		tr.appendChild(E('td', { 'class': 'td' }, String(u.order)));
+		tr.appendChild(E('td', { 'class': 'td', 'data-title': '跃点' }, String(u.order)));
 
 		/* 跟踪 IP —— 行内输入框 */
-		tr.appendChild(E('td', { 'class': 'td' }, this.renderTestInput(u)));
+		tr.appendChild(E('td', { 'class': 'td', 'data-title': '跟踪 IP' }, this.renderTestInput(u)));
 
 		/* 健康 —— 还没选接口的行没有设备可绑，探不了，显示 — 而不是 DOWN */
-		tr.appendChild(E('td', { 'class': 'td' },
+		tr.appendChild(E('td', { 'class': 'td', 'data-title': '健康' },
 			u.device
 				? E('span', {
 					'style': 'color: var(--' + (healthy ? 'success' : 'error') + '-color-high); font-weight: bold;'
@@ -419,9 +465,9 @@ return view.extend({
 				.then(function() { return self.reloadStatus(); });
 		});
 
-		tr.appendChild(E('td', { 'class': 'td' }, [
-			act4 ? E('span', { 'style': 'color: var(--success-color-high); font-weight: bold;' }, 'v4 ') : '',
-			act6 ? E('span', { 'style': 'color: var(--success-color-high); font-weight: bold;' }, 'v6 ') : '',
+		tr.appendChild(E('td', { 'class': 'td', 'data-title': '生效 / 启用' }, [
+			act4 ? E('span', { 'style': 'color: var(--success-color-high); font-weight: bold;' }, 'IPv4 ') : '',
+			act6 ? E('span', { 'style': 'color: var(--success-color-high); font-weight: bold;' }, 'IPv6 ') : '',
 			toggle
 		]));
 
@@ -527,15 +573,22 @@ return view.extend({
 			});
 		});
 
+		/* 主题把 .cbi-page-actions 设成 flex + nowrap，按钮 flex:1 1 0% 被均分 ——
+		   窄屏 6 个按钮各 59px，文字 72~100px 全被省略号截掉。
+		   这里改成可换行、按钮按内容宽，行距用 gap（原来的 ' ' 文本节点
+		   在 flex 里是匿名项，换成 gap 更稳）。 */
+		[ btnAdd, btnCheck, btnRefresh, btnSync, btnReloadNet, btnClear ]
+			.forEach(function(b) { b.style.flex = '0 0 auto'; });
+
 		return E('div', {}, [
 			E('h2', {}, 'MultiWanx'),
 			E('p', { 'class': 'cbi-value-description' },
 				'按跃点从小到大选出口，数字越小越优先。改动即时生效，无需重启服务。'),
 
-			E('div', { 'class': 'cbi-page-actions', 'style': 'margin: 0.4em 0 1em 0;' }, [
-				btnAdd, ' ', btnCheck, ' ', btnRefresh, ' ', btnSync, ' ',
-				btnReloadNet, ' ', btnClear
-			]),
+			E('div', {
+				'class': 'cbi-page-actions',
+				'style': 'margin: 0.4em 0 1em 0; flex-wrap: wrap; gap: 6px; justify-content: flex-start;'
+			}, [ btnAdd, btnCheck, btnRefresh, btnSync, btnReloadNet, btnClear ]),
 
 			table
 		]);
